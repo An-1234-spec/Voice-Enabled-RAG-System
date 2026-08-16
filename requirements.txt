@@ -1,0 +1,42 @@
+# ===== Core Framework =====
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# ===== Dataset & Data Processing =====
+datasets==3.3.2
+pandas==2.2.3
+
+# ===== Embeddings & ML =====
+sentence-transformers==3.4.1
+torch==2.5.1
+transformers==4.48.1
+tokenizers==0.21.0
+
+# ===== Vector Database =====
+faiss-cpu==1.9.0.post1
+
+# ===== BM25 =====
+rank-bm25==0.2.2
+
+# ===== LLM Client =====
+groq==0.15.0
+openai==1.59.7
+
+# ===== Speech-to-Text =====
+sarvamai==0.1.13
+
+# ===== Utilities =====
+python-dotenv==1.0.1
+numpy==1.26.4
+scipy==1.15.1
+tqdm==4.67.1
+httpx==0.28.1
+
+# ===== Evaluation =====
+scikit-learn==1.6.1
+
+# ===== Testing =====
+pytest==8.3.4
