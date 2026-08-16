@@ -143,6 +143,7 @@ def preprocess(
                     "answer": clean_text(record.get("answer", "")),
                     "is_selected": is_selected,
                     "language": record.get("target_lang", "eng_Latn"),
+                    "target_language": record.get("target_lang", ""),
                     "passage_idx": passage["passage_idx"],
                 }
 
