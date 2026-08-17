@@ -2,8 +2,9 @@
 evaluation/retrieval_eval.py
 
 Evaluates retrieval quality per chunking strategy across multiple retrieval
-modes (dense / bm25 / hybrid), using the is_selected relevance labels
-carried on each Chunk as ground truth: Recall@k, Precision@k, MRR.
+modes (dense / bm25 / hybrid / hybrid_rerank), using the is_selected
+relevance labels carried on each Chunk as ground truth: Recall@k,
+Precision@k, MRR.
 
 GROUND TRUTH: built directly from data/processed/chunks/<strategy>.jsonl
   - group chunks by query_id
@@ -17,14 +18,17 @@ strategies with more chunks/passage crowd out other passages at low k.
 So we retrieve top_n_raw chunks, collapse to a rank-ordered list of unique
 passage_ids (first occurrence wins), then score Recall/Precision/MRR at k
 against that deduped list. This applies identically regardless of mode,
-since dense/bm25/hybrid all return the same result shape
+since dense/bm25/hybrid/hybrid_rerank all return the same result shape
 (chunk_id, document_id, passage_id, score, text, strategy).
 
-NOT YET IMPLEMENTED: hybrid_rerank (needs retrieval/reranker.py, which
-doesn't exist yet). Requesting it raises NotImplementedError.
+NOTE ON hybrid_rerank: retrieve_n is set to top_n_raw (not the plan's
+production default of 30), so this mode searches the same size candidate
+pool as dense/bm25/hybrid - a fair eval comparison. Production config
+(top-30 -> rerank -> top-5) is narrower; pass --top-n-raw 30 if you want
+eval to match production exactly.
 
 Usage:
-    python -m evaluation.retrieval_eval --strategies all --modes dense,bm25,hybrid \
+    python -m evaluation.retrieval_eval --strategies all --modes dense,bm25,hybrid,hybrid_rerank \
         --k-values 1,5,10 --top-n-raw 50 --max-queries 200
 """
 
@@ -38,9 +42,10 @@ from sentence_transformers import SentenceTransformer
 from retrieval.vector_retriever import VectorRetriever
 from retrieval.bm25_retriever import BM25Retriever
 from retrieval.hybrid_retriever import HybridRetriever
+from retrieval.reranker import RerankedRetriever
 
 ALL_STRATEGIES = ["fixed_token", "passage", "sentence", "parent_child", "semantic"]
-ALL_MODES = ["dense", "bm25", "hybrid"]  # hybrid_rerank excluded: reranker.py doesn't exist yet
+ALL_MODES = ["dense", "bm25", "hybrid", "hybrid_rerank"]
 
 
 def build_ground_truth(chunks_path: Path) -> tuple[dict[int, str], dict[int, set[str]]]:
@@ -111,6 +116,7 @@ def get_retriever(
     chunks_dir: Path,
     dense_weight: float,
     bm25_weight: float,
+    top_n_raw: int,
 ):
     """Factory: returns any retriever exposing .search(query, top_k) -> list[dict]."""
     if mode == "dense":
@@ -126,10 +132,19 @@ def get_retriever(
             bm25_weight=bm25_weight,
             model=model,
         )
-    else:
-        raise NotImplementedError(
-            f"mode '{mode}' requires retrieval/reranker.py, which hasn't been built yet."
+    elif mode == "hybrid_rerank":
+        return RerankedRetriever(
+            strategy=strategy,
+            base_mode="hybrid",
+            faiss_dir=faiss_dir,
+            chunks_dir=chunks_dir,
+            dense_weight=dense_weight,
+            bm25_weight=bm25_weight,
+            retrieve_n=top_n_raw,
+            model=model,
         )
+    else:
+        raise NotImplementedError(f"mode '{mode}' is not supported.")
 
 
 def evaluate_strategy(
@@ -156,17 +171,23 @@ def evaluate_strategy(
         print(f"  [skip] {strategy}/{mode}: no queries with relevant passages found")
         return {}
 
-    retriever = get_retriever(mode, strategy, model, faiss_dir, chunks_dir, dense_weight, bm25_weight)
+    retriever = get_retriever(mode, strategy, model, faiss_dir, chunks_dir, dense_weight, bm25_weight, top_n_raw)
 
     totals = defaultdict(list)
     for qid in query_ids:
         query_text = queries[qid]
         relevant_ids = relevant[qid]
 
+        # HybridRetriever additionally takes top_n_raw (candidates pulled from
+        # each of dense/bm25 before fusion) - must match top_k here or hybrid
+        # silently fuses over its own default (30) instead of the eval's pool size.
+        # RerankedRetriever's pool size is fixed at construction (retrieve_n
+        # above), so it only needs top_k here, same as dense/bm25.
         if mode == "hybrid":
             raw_results = retriever.search(query_text, top_k=top_n_raw, top_n_raw=top_n_raw)
         else:
             raw_results = retriever.search(query_text, top_k=top_n_raw)
+
         ranked_passages = dedupe_to_passages(raw_results)
 
         scores = score_query(ranked_passages, relevant_ids, k_values)
@@ -218,8 +239,8 @@ def main():
     parser.add_argument(
         "--modes",
         type=str,
-        default="dense,bm25,hybrid",
-        help="Comma-separated: dense,bm25,hybrid (hybrid_rerank not yet available)",
+        default="dense,bm25,hybrid,hybrid_rerank",
+        help="Comma-separated: dense,bm25,hybrid,hybrid_rerank",
     )
     parser.add_argument("--faiss-dir", type=Path, default=Path("data/processed/faiss"))
     parser.add_argument("--chunks-dir", type=Path, default=Path("data/processed/chunks"))
@@ -236,10 +257,7 @@ def main():
 
     for mode in modes:
         if mode not in ALL_MODES:
-            raise NotImplementedError(
-                f"mode '{mode}' is not available yet. Supported: {ALL_MODES} "
-                f"(hybrid_rerank needs retrieval/reranker.py, not built yet)."
-            )
+            raise NotImplementedError(f"mode '{mode}' is not available. Supported: {ALL_MODES}")
 
     print("Loading shared embedding model...")
     model = SentenceTransformer("all-MiniLM-L6-v2")
