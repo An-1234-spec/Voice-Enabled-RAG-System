@@ -197,7 +197,8 @@ async def voice(
         "audio/webm", "audio/mp3", "audio/mpeg",
         "audio/ogg", "audio/flac", "application/octet-stream",
     }
-    if file.content_type and file.content_type not in allowed_types:
+    content_type = file.content_type.split(";")[0].strip() if file.content_type else ""
+    if content_type and content_type not in allowed_types:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported audio format: {file.content_type}. Use WAV, WebM, MP3, OGG, or FLAC.",
