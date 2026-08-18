@@ -67,8 +67,9 @@ class RelevanceGuardrail:
 
         self.model = model or SentenceTransformer("all-MiniLM-L6-v2")
 
-    def check(self, query: str) -> RelevanceResult:
-        query_vec = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
+    def check(self, query: str, query_vec: np.ndarray | None = None) -> RelevanceResult:
+        if query_vec is None:
+            query_vec = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
         similarity = float(np.dot(query_vec, self.centroid))  # both unit-length -> dot product == cosine similarity
 
         if similarity < self.threshold:

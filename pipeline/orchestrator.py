@@ -39,11 +39,13 @@ Usage (CLI smoke test):
 """
 
 import argparse
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from guardrails.safety import SafetyGuardrail
@@ -98,6 +100,8 @@ class RAGOrchestrator:
         )
         self.llm = GroqLLMClient(model=groq_model) if groq_model else GroqLLMClient()
         self.grounding_threshold = grounding_threshold
+        self._cache = {}
+        self._cache_lock = threading.Lock()
 
     def _refuse(self, request_id: str, query: str, reason: str, stage: str, latency_ms: dict) -> RAGResponse:
         return RAGResponse(
@@ -110,6 +114,22 @@ class RAGOrchestrator:
         latency_ms: dict[str, float] = {}
         t_start = time.perf_counter()
 
+        # Check Cache
+        normalized_query = query.strip().lower()
+        with self._cache_lock:
+            if normalized_query in self._cache:
+                cached = self._cache[normalized_query]
+                return RAGResponse(
+                    request_id=request_id,
+                    query=query,
+                    answer=cached.answer,
+                    grounded=cached.grounded,
+                    sources=cached.sources,
+                    refusal_reason=cached.refusal_reason,
+                    stage_reached="cached_response",
+                    latency_ms={"total_ms": (time.perf_counter() - t_start) * 1000},
+                )
+
         def mark(stage: str, t0: float):
             latency_ms[stage] = (time.perf_counter() - t0) * 1000
 
@@ -121,17 +141,26 @@ class RAGOrchestrator:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
             return self._refuse(request_id, query, safety_result.reason, "safety_check", latency_ms)
 
+        # Pre-compute query embedding exactly once to reuse for both relevance check and dense retrieval
+        t_embed = time.perf_counter()
+        query_vec = self.embed_model.encode(
+            [query], convert_to_numpy=True, normalize_embeddings=True
+        )[0]
+        embed_ms = (time.perf_counter() - t_embed) * 1000
+
         # 2. Relevance (known weak discrimination on this corpus - see grounding module docstring)
         t0 = time.perf_counter()
-        relevance_result = self.relevance.check(query)
+        relevance_result = self.relevance.check(query, query_vec=query_vec)
         mark("relevance_ms", t0)
+        # Attribute query embedding encoding time to relevance_ms for latency tracking
+        latency_ms["relevance_ms"] += embed_ms
         if not relevance_result.passed:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
             return self._refuse(request_id, query, relevance_result.reason, "relevance_check", latency_ms)
 
         # 3. Retrieval (hybrid + rerank)
         t0 = time.perf_counter()
-        chunks = self.retriever.search(query, top_k=self.top_k)
+        chunks = self.retriever.search(query, top_k=self.top_k, query_vec=query_vec)
         mark("retrieval_ms", t0)
         if not chunks:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
@@ -181,7 +210,7 @@ class RAGOrchestrator:
 
         latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
 
-        return RAGResponse(
+        response = RAGResponse(
             request_id=request_id,
             query=query,
             answer=result.answer,
@@ -198,6 +227,9 @@ class RAGOrchestrator:
             stage_reached="structured_response",
             latency_ms=latency_ms,
         )
+        with self._cache_lock:
+            self._cache[normalized_query] = response
+        return response
 
 
 def _resolve(chunks: list[dict], tag: str) -> dict | None:

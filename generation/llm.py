@@ -1,36 +1,31 @@
 """
 generation/llm.py
 
-LLM client using the Groq API (OpenAI-compatible) for RAG answer
-generation. Structured JSON output, parsed and validated defensively.
-
-MODEL: default is openai/gpt-oss-20b, NOT llama-3.1-8b-instant as
-originally specified in the project plan - Groq has deprecated
-llama-3.1-8b-instant and llama-3.3-70b-versatile. gpt-oss-20b is their
-current recommended small/fast general-purpose replacement (closest fit
-to the original plan's speed rationale). Verify current model
-availability/pricing at console.groq.com before final submission.
-
-REQUIRES: GROQ_API_KEY set in the environment before running.
-    PowerShell:  $env:GROQ_API_KEY="your-key-here"
-
-Usage (CLI smoke test - requires a real API key and network access):
-    python -m generation.llm --query "what is a corporation?" --strategy fixed_token
+Unified LLM client supporting multiple low-latency providers (Groq, Gemini, OpenAI).
+Swappable via environment variables (LLM_PROVIDER, LLM_MODEL) or config settings.
+Integrates persistent HTTP connection pooling.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from groq import Groq
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+try:
+    from google import genai
+    from google.genai import types
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
+from config.settings import settings
 from generation.prompts import build_messages
-from retrieval.reranker import RerankedRetriever
-
-DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 
 @dataclass
@@ -42,9 +37,7 @@ class LLMResult:
     parse_error: bool = False
     raw_text: str | None = None  # populated only on parse_error, for debugging
 
-    # Groq server-side timing breakdown (from response.usage), in ms.
-    # Lets the orchestrator/eval scripts separate "our pipeline" latency
-    # from "Groq's queue + compute" latency instead of one blended number.
+    # timing breakdown in ms (namespaced for backward compatibility)
     groq_queue_ms: float = 0.0
     groq_prompt_ms: float = 0.0
     groq_completion_ms: float = 0.0
@@ -52,55 +45,163 @@ class LLMResult:
 
 
 class GroqLLMClient:
-    """Wraps Groq's chat completion endpoint for RAG answer generation."""
+    """Unified LLM Client supporting Groq, Gemini, and OpenAI with connection pooling."""
 
-    def __init__(self, model: str = DEFAULT_MODEL, api_key: str | None = None):
-        key = api_key or os.environ.get("GROQ_API_KEY")
-        if not key:
-            raise EnvironmentError(
-                "GROQ_API_KEY not set. Set it in your environment before running "
-                '(PowerShell: $env:GROQ_API_KEY="your-key-here"), or pass api_key= explicitly.'
-            )
-        self.model = model
-        self.client = Groq(api_key=key)
+    def __init__(
+        self,
+        model: str | None = None,
+        provider: str | None = None,
+        api_key: str | None = None,
+    ):
+        self.provider = provider or os.environ.get("LLM_PROVIDER") or settings.llm_provider
+        self.provider = self.provider.lower()
+
+        # Resolve model name based on provider
+        if model:
+            self.model = model
+        else:
+            self.model = os.environ.get("LLM_MODEL") or settings.llm_model
+            # Only apply default fallback if self.model is empty or matches the slow/mock default
+            if not self.model or self.model == "openai/gpt-oss-20b":
+                if self.provider == "gemini":
+                    self.model = "gemini-2.5-flash"
+                elif self.provider == "openai":
+                    self.model = "gpt-4o-mini"
+                elif self.provider == "groq":
+                    self.model = "llama-3.1-8b-instant"  # highly optimized on Groq
+
+        # Initialize the appropriate client
+        self.groq_client = None
+        self.openai_client = None
+        self.gemini_client = None
+
+        if self.provider == "groq":
+            key = api_key or os.environ.get("GROQ_API_KEY") or settings.groq_api_key
+            if not key:
+                raise EnvironmentError("GROQ_API_KEY not set. Add it to your .env or environment.")
+            self.groq_client = Groq(api_key=key)
+        elif self.provider == "gemini":
+            if not GEMINI_AVAILABLE:
+                raise ImportError("google-genai SDK is not installed. Run `pip install google-genai`.")
+            key = api_key or os.environ.get("GEMINI_API_KEY") or settings.gemini_api_key
+            if not key:
+                raise EnvironmentError("GEMINI_API_KEY not set. Add it to your .env or environment.")
+            self.gemini_client = genai.Client(api_key=key)
+        elif self.provider == "openai":
+            key = api_key or os.environ.get("OPENAI_API_KEY") or settings.openai_api_key
+            if not key:
+                raise EnvironmentError("OPENAI_API_KEY not set. Add it to your .env or environment.")
+            self.openai_client = OpenAI(api_key=key)
+        else:
+            raise ValueError(f"Unsupported LLM provider: {self.provider}. Use 'groq', 'gemini', or 'openai'.")
 
     def generate(
         self,
         query: str,
         chunks: list[dict],
         temperature: float = 0.0,
-        max_completion_tokens: int = 300,
-        reasoning_effort: str = "low",
+        max_completion_tokens: int = 100,  # optimized for short 1-2 sentence answers
+        reasoning_effort: str | None = None,
+        **kwargs,
     ) -> LLMResult:
         messages = build_messages(query, chunks)
+        max_tokens = kwargs.get("max_tokens") or max_completion_tokens
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_completion_tokens=max_completion_tokens,
-            response_format={"type": "json_object"},
-            extra_body={"reasoning_effort": reasoning_effort},
-        )
-        choice = response.choices[0]
-        raw_text = choice.message.content
+        t_start = time.perf_counter()
 
-        u = response.usage
-        groq_timing = dict(
-            groq_queue_ms=u.queue_time * 1000,
-            groq_prompt_ms=u.prompt_time * 1000,
-            groq_completion_ms=u.completion_time * 1000,
-            groq_server_total_ms=u.total_time * 1000,
-        )
+        if self.provider == "groq":
+            extra_body = {}
+            # Only add reasoning effort if model is a reasoning model or explicitly requested
+            if reasoning_effort and "gpt-oss" in self.model:
+                extra_body["reasoning_effort"] = reasoning_effort
 
-        if choice.finish_reason == "length":
+            response = self.groq_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_completion_tokens=max_tokens,
+                response_format={"type": "json_object"},
+                extra_body=extra_body if extra_body else None,
+            )
+            raw_text = response.choices[0].message.content
+            finish_reason = response.choices[0].finish_reason
+            
+            # Extract server usage metrics
+            u = response.usage
+            timing = dict(
+                groq_queue_ms=getattr(u, "queue_time", 0.0) * 1000,
+                groq_prompt_ms=getattr(u, "prompt_time", 0.0) * 1000,
+                groq_completion_ms=getattr(u, "completion_time", 0.0) * 1000,
+                groq_server_total_ms=getattr(u, "total_time", 0.0) * 1000,
+            )
+
+        elif self.provider == "gemini":
+            # For Gemini SDK, we convert chat completion messages structure
+            gemini_contents = []
+            system_instruction = None
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_instruction = msg["content"]
+                else:
+                    # Map role to user/model
+                    role = "user" if msg["role"] == "user" else "model"
+                    gemini_contents.append(
+                        types.Content(
+                            role=role,
+                            parts=[types.Part.from_text(text=msg["content"])],
+                        )
+                    )
+
+            response = self.gemini_client.models.generate_content(
+                model=self.model,
+                contents=gemini_contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json",
+                ),
+            )
+            raw_text = response.text
+            finish_reason = None # Available in candidates if needed
+
+            # Measure wall-clock API duration as server total (no server timing breakdown available)
+            wall_ms = (time.perf_counter() - t_start) * 1000
+            timing = dict(
+                groq_queue_ms=0.0,
+                groq_prompt_ms=0.0,
+                groq_completion_ms=wall_ms,
+                groq_server_total_ms=wall_ms,
+            )
+
+        elif self.provider == "openai":
+            response = self.openai_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            raw_text = response.choices[0].message.content
+            finish_reason = response.choices[0].finish_reason
+
+            # Measure wall-clock API duration as server total
+            wall_ms = (time.perf_counter() - t_start) * 1000
+            timing = dict(
+                groq_queue_ms=0.0,
+                groq_prompt_ms=0.0,
+                groq_completion_ms=wall_ms,
+                groq_server_total_ms=wall_ms,
+            )
+
+        if finish_reason == "length":
             return LLMResult(
                 answer="",
                 grounded=False,
                 refusal_reason="LLM output truncated (finish_reason=length)",
                 parse_error=True,
                 raw_text=raw_text,
-                **groq_timing,
+                **timing,
             )
 
         try:
@@ -110,63 +211,14 @@ class GroqLLMClient:
                 grounded=bool(parsed.get("grounded", False)),
                 sources_used=parsed.get("sources_used", []),
                 refusal_reason=parsed.get("refusal_reason"),
-                **groq_timing,
+                **timing,
             )
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             return LLMResult(
                 answer="",
                 grounded=False,
                 refusal_reason="LLM returned malformed JSON",
                 parse_error=True,
                 raw_text=raw_text,
-                **groq_timing,
+                **timing,
             )
-
-
-def main():
-    parser = argparse.ArgumentParser(description="RAG generation smoke test (retrieval + LLM answer).")
-    parser.add_argument("--query", type=str, required=True)
-    parser.add_argument("--strategy", type=str, default="fixed_token")
-    parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--retrieve-n", type=int, default=10)
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--faiss-dir", type=Path, default=Path("data/processed/faiss"))
-    parser.add_argument("--chunks-dir", type=Path, default=Path("data/processed/chunks"))
-    args = parser.parse_args()
-
-    print("Loading embedding model + retriever...")
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-    retriever = RerankedRetriever(
-        strategy=args.strategy,
-        base_mode="hybrid",
-        faiss_dir=args.faiss_dir,
-        chunks_dir=args.chunks_dir,
-        retrieve_n=args.retrieve_n,
-        model=embed_model,
-    )
-
-    print(f"Retrieving top-{args.top_k} chunks for: {args.query}")
-    chunks = retriever.search(args.query, top_k=args.top_k)
-    for i, c in enumerate(chunks, 1):
-        print(f"  [S{i}] {c['text'][:80]}...")
-
-    print(f"\nCalling Groq ({args.model})...")
-    llm = GroqLLMClient(model=args.model)
-    result = llm.generate(args.query, chunks)
-
-    print(f"\nAnswer: {result.answer}")
-    print(f"Grounded: {result.grounded}")
-    print(f"Sources used: {result.sources_used}")
-    if result.refusal_reason:
-        print(f"Refusal reason: {result.refusal_reason}")
-    if result.parse_error:
-        print(f"[WARNING] JSON parse failed. Raw output:\n{result.raw_text}")
-    print(
-        f"\n[groq server timing] queue={result.groq_queue_ms:.0f}ms "
-        f"prompt={result.groq_prompt_ms:.0f}ms completion={result.groq_completion_ms:.0f}ms "
-        f"total={result.groq_server_total_ms:.0f}ms"
-    )
-
-
-if __name__ == "__main__":
-    main()

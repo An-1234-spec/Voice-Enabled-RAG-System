@@ -73,12 +73,15 @@ class VectorRetriever:
         # reloading MiniLM once per strategy when querying multiple indexes).
         self.model = model or SentenceTransformer(model_name)
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
-        query_vec = self.model.encode(
-            [query],
-            convert_to_numpy=True,
-            normalize_embeddings=True,  # must match embedder.py, or IP scores are meaningless
-        ).astype(np.float32)
+    def search(self, query: str, top_k: int = 5, query_vec: np.ndarray | None = None) -> list[dict]:
+        if query_vec is None:
+            query_vec = self.model.encode(
+                [query],
+                convert_to_numpy=True,
+                normalize_embeddings=True,  # must match embedder.py, or IP scores are meaningless
+            ).astype(np.float32)
+        else:
+            query_vec = np.atleast_2d(query_vec).astype(np.float32)
 
         scores, indices = self.index.search(query_vec, top_k)
 

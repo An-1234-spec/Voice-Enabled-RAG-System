@@ -26,6 +26,7 @@ Usage (CLI smoke test):
 import argparse
 from pathlib import Path
 
+import numpy as np
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from retrieval.vector_retriever import VectorRetriever
@@ -92,8 +93,11 @@ class RerankedRetriever:
         else:
             raise ValueError(f"Unknown base_mode '{base_mode}'")
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
-        candidates = self.base.search(query, top_k=self.retrieve_n)
+    def search(self, query: str, top_k: int = 5, query_vec: np.ndarray | None = None) -> list[dict]:
+        if isinstance(self.base, (VectorRetriever, HybridRetriever)):
+            candidates = self.base.search(query, top_k=self.retrieve_n, query_vec=query_vec)
+        else:
+            candidates = self.base.search(query, top_k=self.retrieve_n)
         return self.reranker.rerank(query, candidates, top_k=top_k)
 
 

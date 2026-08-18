@@ -20,6 +20,7 @@ Usage (CLI smoke test):
 import argparse
 from pathlib import Path
 
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from retrieval.vector_retriever import VectorRetriever
@@ -65,8 +66,8 @@ class HybridRetriever:
         )
         self.bm25 = BM25Retriever(strategy=strategy, chunks_dir=chunks_dir)
 
-    def search(self, query: str, top_k: int = 5, top_n_raw: int = 30) -> list[dict]:
-        dense_results = self.dense.search(query, top_k=top_n_raw)
+    def search(self, query: str, top_k: int = 5, top_n_raw: int = 30, query_vec: np.ndarray | None = None) -> list[dict]:
+        dense_results = self.dense.search(query, top_k=top_n_raw, query_vec=query_vec)
         bm25_results = self.bm25.search(query, top_k=top_n_raw)
 
         dense_norm = min_max_normalize(dense_results)
