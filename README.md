@@ -26,17 +26,20 @@ A production-quality, voice-enabled Retrieval-Augmented Generation (RAG) system 
                                         └───┬───┘
                                         Score Fusion
                                             │
-                                    Cross-Encoder Reranker
+                                    Top-K Selection (Default: 3)
                                             │
-                                    Context Selection (Top 5)
-                                            │
-                                    LLM Generation (Groq)
-                                            │
-                                    Output Validation
-                                            │
-                                    Grounding Check
-                                            │
-                                    ✅ Structured Response
+                                   ┌───→ LLM Generation (Groq)
+                                   │        │
+                                   │        ▼
+                                   │     Output Validation
+                                   │        │
+                                   │        ▼
+                                   │     Grounding Check
+                                   │        │
+                                   └────────┼───────┐
+                                      fail  │       │pass
+                                    (retry  ▼       ▼
+                                     once) 🚫 Refuse  ✅ Structured Response
 ```
 
 ## Technology Stack
