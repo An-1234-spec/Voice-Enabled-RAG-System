@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Voice-Enabled RAG System — Ask questions via voice or text, powered by hybrid retrieval and grounded LLM generation.">
+    <title>Voice RAG — HH Goa 2026</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* ── CSS Reset & Variables ──────────────────────────────────── */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #111827;
+            --bg-card: rgba(17, 24, 39, 0.65);
+            --bg-card-hover: rgba(17, 24, 39, 0.85);
+            --border-glass: rgba(255, 255, 255, 0.08);
+            --border-accent: rgba(99, 102, 241, 0.3);
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --accent-glow: rgba(99, 102, 241, 0.25);
+            --success: #22c55e;
+            --success-bg: rgba(34, 197, 94, 0.1);
+            --warning: #f59e0b;
+            --warning-bg: rgba(245, 158, 11, 0.1);
+            --danger: #ef4444;
+            --danger-bg: rgba(239, 68, 68, 0.1);
+            --radius: 16px;
+            --radius-sm: 10px;
+            --shadow-lg: 0 24px 48px rgba(0, 0, 0, 0.4);
+            --transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* ── Animated Background ───────────────────────────────────── */
+        .bg-gradient {
+            position: fixed;
+            inset: 0;
+            z-index: -1;
+            background:
+                radial-gradient(ellipse 80% 60% at 20% 10%, rgba(99, 102, 241, 0.12), transparent 60%),
+                radial-gradient(ellipse 60% 50% at 80% 90%, rgba(139, 92, 246, 0.08), transparent 50%),
+                radial-gradient(ellipse 50% 40% at 50% 50%, rgba(59, 130, 246, 0.06), transparent 50%),
+                var(--bg-primary);
+            animation: bgShift 20s ease-in-out infinite alternate;
+        }
+        @keyframes bgShift {
+            0% { opacity: 1; }
+            100% { opacity: 0.85; }
+        }
+
+        /* ── Layout ────────────────────────────────────────────────── */
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 24px 20px 60px;
+        }
+
+        /* ── Header ────────────────────────────────────────────────── */
+        .header {
+            text-align: center;
+            padding: 40px 0 32px;
+            animation: fadeInDown 0.6s ease-out;
+        }
+        .header h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-light), #a78bfa, #60a5fa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.02em;
+        }
+        .header .subtitle {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            margin-top: 8px;
+            font-weight: 400;
+        }
+        .header .badge {
+            display: inline-block;
+            margin-top: 12px;
+            padding: 4px 14px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            background: var(--accent-glow);
+            color: var(--accent-light);
+            border: 1px solid var(--border-accent);
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        /* ── Glass Card ────────────────────────────────────────────── */
+        .glass {
+            background: var(--bg-card);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            border: 1px solid var(--border-glass);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-lg);
+            transition: border-color var(--transition), box-shadow var(--transition);
+        }
+        .glass:hover {
+            border-color: var(--border-accent);
+        }
+
+        /* ── Input Area ────────────────────────────────────────────── */
+        .input-section {
+            padding: 28px;
+            margin-bottom: 24px;
+            animation: fadeInUp 0.5s ease-out 0.1s both;
+        }
+
+        .input-row {
+            display: flex;
+            gap: 12px;
+            align-items: stretch;
+        }
+
+        .input-wrapper {
+            flex: 1;
+            position: relative;
+        }
+
+        #query-input {
+            width: 100%;
+            padding: 14px 18px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-glass);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color var(--transition), box-shadow var(--transition);
+        }
+        #query-input::placeholder { color: var(--text-muted); }
+        #query-input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 14px 24px;
+            border: none;
+            border-radius: var(--radius-sm);
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all var(--transition);
+            white-space: nowrap;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent), #7c3aed);
+            color: #fff;
+            box-shadow: 0 4px 14px var(--accent-glow);
+        }
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 24px var(--accent-glow);
+        }
+        .btn-primary:active:not(:disabled) { transform: translateY(0); }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-mic {
+            width: 52px;
+            min-width: 52px;
+            padding: 14px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid var(--border-glass);
+            color: var(--text-secondary);
+        }
+        .btn-mic:hover:not(:disabled) {
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--text-primary);
+            border-color: var(--border-accent);
+        }
+        .btn-mic.recording {
+            background: var(--danger-bg);
+            border-color: var(--danger);
+            color: var(--danger);
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.3); }
+            50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+        }
+
+        .input-hint {
+            margin-top: 10px;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+        }
+
+        /* ── Loading ───────────────────────────────────────────────── */
+        .loading-bar {
+            height: 3px;
+            background: linear-gradient(90deg, transparent, var(--accent), transparent);
+            border-radius: 2px;
+            margin-top: 16px;
+            animation: shimmer 1.5s ease-in-out infinite;
+            display: none;
+        }
+        .loading-bar.active { display: block; }
+        @keyframes shimmer {
+            0% { opacity: 0.3; transform: translateX(-100%); }
+            50% { opacity: 1; }
+            100% { opacity: 0.3; transform: translateX(100%); }
+        }
+
+        /* ── Results ───────────────────────────────────────────────── */
+        .results-section {
+            display: none;
+            animation: fadeInUp 0.5s ease-out;
+        }
+        .results-section.visible { display: block; }
+
+        .result-card {
+            padding: 24px 28px;
+            margin-bottom: 16px;
+        }
+
+        .result-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .result-label {
+            font-size: 0.78rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+        }
+
+        /* Status badges */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .status-badge.grounded {
+            background: var(--success-bg);
+            color: var(--success);
+            border: 1px solid rgba(34, 197, 94, 0.2);
+        }
+        .status-badge.ungrounded {
+            background: var(--warning-bg);
+            color: var(--warning);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+        }
+        .status-badge.refused {
+            background: var(--danger-bg);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+        .status-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        /* Answer text */
+        .answer-text {
+            font-size: 1.05rem;
+            line-height: 1.7;
+            color: var(--text-primary);
+        }
+        .answer-text.refused {
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        /* Transcript */
+        .transcript {
+            padding: 12px 16px;
+            background: rgba(99, 102, 241, 0.06);
+            border-left: 3px solid var(--accent);
+            border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+        }
+        .transcript-label {
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--accent-light);
+            margin-bottom: 4px;
+            letter-spacing: 0.05em;
+        }
+
+        /* Sources */
+        .sources-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .source-item {
+            padding: 14px 16px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: var(--radius-sm);
+            transition: border-color var(--transition);
+        }
+        .source-item:hover { border-color: var(--border-accent); }
+        .source-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        .source-id {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-light);
+            background: rgba(99, 102, 241, 0.1);
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+        .source-score {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        .source-text {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        /* Latency */
+        .latency-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 10px;
+        }
+        .latency-item {
+            padding: 12px 14px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: var(--radius-sm);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .latency-label {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            letter-spacing: 0.04em;
+            margin-bottom: 4px;
+        }
+        .latency-value {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .latency-value .unit {
+            font-size: 0.75rem;
+            font-weight: 400;
+            color: var(--text-muted);
+            margin-left: 2px;
+        }
+
+        /* ── Animations ────────────────────────────────────────────── */
+        @keyframes fadeInDown {
+            from { opacity: 0; transform: translateY(-16px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(16px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ── Responsive ────────────────────────────────────────────── */
+        @media (max-width: 600px) {
+            .container { padding: 16px 12px 40px; }
+            .header h1 { font-size: 1.6rem; }
+            .input-row { flex-direction: column; }
+            .btn-mic { width: 100%; min-width: auto; }
+            .latency-grid { grid-template-columns: repeat(2, 1fr); }
+            .result-card { padding: 18px 16px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-gradient"></div>
+
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>Voice-Enabled RAG</h1>
+            <p class="subtitle">Hybrid retrieval · Cross-encoder reranking · Grounded generation</p>
+            <span class="badge">HH Goa 2026</span>
+        </header>
+
+        <!-- Input -->
+        <section class="input-section glass" id="input-section">
+            <div class="input-row">
+                <button class="btn btn-mic" id="mic-btn" title="Record voice query">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" y1="19" x2="12" y2="23"/>
+                        <line x1="8" y1="23" x2="16" y2="23"/>
+                    </svg>
+                </button>
+                <div class="input-wrapper">
+                    <input type="text" id="query-input" placeholder="Ask a question… or click the mic to speak" autocomplete="off" />
+                </div>
+                <button class="btn btn-primary" id="submit-btn">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                    Ask
+                </button>
+            </div>
+            <p class="input-hint" id="input-hint">Press Enter to search, or click the microphone for voice input</p>
+            <div class="loading-bar" id="loading-bar"></div>
+        </section>
+
+        <!-- Results -->
+        <section class="results-section" id="results-section">
+
+            <!-- Transcript (voice only) -->
+            <div class="result-card glass" id="transcript-card" style="display:none;">
+                <div class="transcript">
+                    <div class="transcript-label">🎤 Voice Transcript</div>
+                    <div id="transcript-text"></div>
+                </div>
+            </div>
+
+            <!-- Answer -->
+            <div class="result-card glass" id="answer-card">
+                <div class="result-header">
+                    <span class="result-label">Answer</span>
+                    <div id="status-badges"></div>
+                </div>
+                <div class="answer-text" id="answer-text"></div>
+                <div id="refusal-reason" style="display:none; margin-top:12px; padding:10px 14px; background:var(--danger-bg); border-radius:var(--radius-sm); font-size:0.85rem; color:var(--danger);"></div>
+            </div>
+
+            <!-- Sources -->
+            <div class="result-card glass" id="sources-card">
+                <div class="result-header">
+                    <span class="result-label">Retrieved Sources</span>
+                    <span class="result-label" id="source-count"></span>
+                </div>
+                <div class="sources-list" id="sources-list"></div>
+            </div>
+
+            <!-- Latency -->
+            <div class="result-card glass" id="latency-card">
+                <div class="result-header">
+                    <span class="result-label">Latency Breakdown</span>
+                </div>
+                <div class="latency-grid" id="latency-grid"></div>
+            </div>
+        </section>
+    </div>
+
+    <script>
+        // ── State ──────────────────────────────────────────────────────
+        const API_BASE = window.location.origin;
+        let isRecording = false;
+        let mediaRecorder = null;
+        let audioChunks = [];
+
+        // ── DOM refs ───────────────────────────────────────────────────
+        const queryInput = document.getElementById('query-input');
+        const submitBtn = document.getElementById('submit-btn');
+        const micBtn = document.getElementById('mic-btn');
+        const loadingBar = document.getElementById('loading-bar');
+        const inputHint = document.getElementById('input-hint');
+        const resultsSection = document.getElementById('results-section');
+        const transcriptCard = document.getElementById('transcript-card');
+        const transcriptText = document.getElementById('transcript-text');
+        const answerText = document.getElementById('answer-text');
+        const statusBadges = document.getElementById('status-badges');
+        const refusalReason = document.getElementById('refusal-reason');
+        const sourcesList = document.getElementById('sources-list');
+        const sourceCount = document.getElementById('source-count');
+        const latencyGrid = document.getElementById('latency-grid');
+
+        // ── Text query ─────────────────────────────────────────────────
+        submitBtn.addEventListener('click', () => submitTextQuery());
+        queryInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                submitTextQuery();
+            }
+        });
+
+        async function submitTextQuery() {
+            const query = queryInput.value.trim();
+            if (!query) return;
+
+            setLoading(true);
+            transcriptCard.style.display = 'none';
+
+            try {
+                const res = await fetch(`${API_BASE}/query`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query }),
+                });
+
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({ detail: res.statusText }));
+                    throw new Error(err.detail || `HTTP ${res.status}`);
+                }
+
+                const data = await res.json();
+                renderResults(data, false);
+            } catch (err) {
+                renderError(err.message);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        // ── Voice query ────────────────────────────────────────────────
+        micBtn.addEventListener('click', toggleRecording);
+
+        async function toggleRecording() {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                // Prefer webm, fall back to whatever is available
+                const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                    ? 'audio/webm;codecs=opus'
+                    : MediaRecorder.isTypeSupported('audio/webm')
+                        ? 'audio/webm'
+                        : '';
+
+                mediaRecorder = mimeType
+                    ? new MediaRecorder(stream, { mimeType })
+                    : new MediaRecorder(stream);
+
+                audioChunks = [];
+                mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+                mediaRecorder.onstop = () => {
+                    stream.getTracks().forEach(t => t.stop());
+                    submitVoiceQuery();
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                micBtn.classList.add('recording');
+                inputHint.textContent = '🔴 Recording… click again to stop';
+            } catch (err) {
+                inputHint.textContent = `❌ Microphone access denied: ${err.message}`;
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            isRecording = false;
+            micBtn.classList.remove('recording');
+            inputHint.textContent = 'Processing voice…';
+        }
+
+        async function submitVoiceQuery() {
+            if (audioChunks.length === 0) {
+                inputHint.textContent = '❌ No audio recorded';
+                return;
+            }
+
+            setLoading(true);
+
+            const mimeType = mediaRecorder?.mimeType || 'audio/webm';
+            const ext = mimeType.includes('webm') ? '.webm' : mimeType.includes('ogg') ? '.ogg' : '.wav';
+            const blob = new Blob(audioChunks, { type: mimeType });
+            const formData = new FormData();
+            formData.append('file', blob, `recording${ext}`);
+
+            try {
+                const res = await fetch(`${API_BASE}/voice`, {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({ detail: res.statusText }));
+                    throw new Error(err.detail || `HTTP ${res.status}`);
+                }
+
+                const data = await res.json();
+                renderResults(data, true);
+            } catch (err) {
+                renderError(err.message);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        // ── Render ─────────────────────────────────────────────────────
+        function setLoading(active) {
+            loadingBar.classList.toggle('active', active);
+            submitBtn.disabled = active;
+            micBtn.disabled = active;
+            if (active) {
+                inputHint.textContent = 'Thinking…';
+            } else {
+                inputHint.textContent = 'Press Enter to search, or click the microphone for voice input';
+            }
+        }
+
+        function renderResults(data, isVoice) {
+            resultsSection.classList.add('visible');
+
+            // Transcript (voice only)
+            if (isVoice && data.transcript) {
+                transcriptCard.style.display = 'block';
+                transcriptText.textContent = data.transcript;
+                queryInput.value = data.transcript;
+            } else {
+                transcriptCard.style.display = 'none';
+            }
+
+            // Status badges
+            let badgeHtml = '';
+            if (data.refusal_reason) {
+                badgeHtml = '<span class="status-badge refused"><span class="status-dot"></span>Refused</span>';
+            } else if (data.grounded) {
+                badgeHtml = '<span class="status-badge grounded"><span class="status-dot"></span>Grounded</span>';
+            } else {
+                badgeHtml = '<span class="status-badge ungrounded"><span class="status-dot"></span>Unverified</span>';
+            }
+            statusBadges.innerHTML = badgeHtml;
+
+            // Answer
+            if (data.answer) {
+                answerText.textContent = data.answer;
+                answerText.classList.remove('refused');
+            } else {
+                answerText.textContent = 'The system could not generate an answer for this query.';
+                answerText.classList.add('refused');
+            }
+
+            // Refusal reason
+            if (data.refusal_reason) {
+                refusalReason.style.display = 'block';
+                refusalReason.textContent = `⚠ ${data.refusal_reason}`;
+            } else {
+                refusalReason.style.display = 'none';
+            }
+
+            // Sources
+            const sources = data.sources || [];
+            sourceCount.textContent = `${sources.length} source${sources.length !== 1 ? 's' : ''}`;
+            sourcesList.innerHTML = sources.map((s, i) => `
+                <div class="source-item">
+                    <div class="source-meta">
+                        <span class="source-id">S${i + 1}</span>
+                        ${s.score != null ? `<span class="source-score">score: ${s.score.toFixed(4)}</span>` : ''}
+                    </div>
+                    <div class="source-text">${escapeHtml(truncate(s.text, 300))}</div>
+                </div>
+            `).join('');
+
+            // Latency
+            const lat = data.latency || {};
+            const items = [];
+            if (lat.stt_ms != null) items.push({ label: 'STT', value: lat.stt_ms });
+            if (lat.safety_ms != null) items.push({ label: 'Safety', value: lat.safety_ms });
+            if (lat.relevance_ms != null) items.push({ label: 'Relevance', value: lat.relevance_ms });
+            if (lat.retrieval_ms != null) items.push({ label: 'Retrieval', value: lat.retrieval_ms });
+            if (lat.generation_ms != null) items.push({ label: 'Generation', value: lat.generation_ms });
+            if (lat.grounding_ms != null) items.push({ label: 'Grounding', value: lat.grounding_ms });
+            if (lat.total_ms != null) items.push({ label: 'Total', value: lat.total_ms });
+
+            latencyGrid.innerHTML = items.map(item => `
+                <div class="latency-item">
+                    <div class="latency-label">${item.label}</div>
+                    <div class="latency-value">${item.value.toFixed(1)}<span class="unit">ms</span></div>
+                </div>
+            `).join('');
+
+            // Scroll into view
+            resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function renderError(message) {
+            resultsSection.classList.add('visible');
+            transcriptCard.style.display = 'none';
+            statusBadges.innerHTML = '<span class="status-badge refused"><span class="status-dot"></span>Error</span>';
+            answerText.textContent = message;
+            answerText.classList.add('refused');
+            refusalReason.style.display = 'none';
+            sourcesList.innerHTML = '';
+            sourceCount.textContent = '';
+            latencyGrid.innerHTML = '';
+        }
+
+        // ── Helpers ────────────────────────────────────────────────────
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        function truncate(str, maxLen) {
+            if (!str) return '';
+            return str.length > maxLen ? str.slice(0, maxLen) + '…' : str;
+        }
+    </script>
+</body>
+</html>
