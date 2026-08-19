@@ -1,48 +1,32 @@
 """
-evaluation/e2e_latency_eval.py
+evaluation/latency_eval.py  (also the end-to-end pipeline latency eval)
 
 True end-to-end RAG pipeline latency, measured via RAGOrchestrator.answer()
-on N queries - the actual production path (safety -> relevance -> retrieval
-[hybrid, no rerank - matches prod, see project status notes] -> generation
-[Groq] -> output validation -> grounding -> structured response).
+on N queries — the actual production path (safety → relevance → retrieval
+[hybrid, no rerank — matches prod] → generation → output validation →
+grounding → structured response).
 
-Complements evaluation/latency_eval.py, which measures retrieval sub-stages
-(dense/bm25/fusion/rerank) in isolation for the rerank tradeoff study.
-This script measures the whole pipeline as a user would actually experience
-it, including real Groq network + queue time.
-
-WHY THIS EXISTS: latency_eval.py's docstring flags that pipeline/*,
-guardrails/*, and generation/llm.py didn't exist yet when it was written,
-so it could only report retrieval-only numbers. Those pieces are all built
-now - this script fills that gap with the real end-to-end figure.
-
-WHAT'S REPORTED, per stage, P50/P70/P100:
-  - safety_ms, relevance_ms, retrieval_ms      (guardrails + retrieval)
-  - generation_ms                              (wall clock around Groq call,
-                                                 summed across retry attempts)
-  - groq_queue_ms, groq_completion_ms,
-    groq_server_total_ms                       (Groq's own server clock,
-                                                 summed across retry attempts -
-                                                 see generation/llm.py)
+WHAT'S REPORTED per stage, at P50 / P70 / P100:
+  - safety_ms, relevance_ms          (guardrails — always run)
+  - retrieval_ms                     (hybrid BM25 + dense)
+  - generation_ms                    (wall clock around LLM call, all attempts)
+  - groq_queue_ms, groq_completion_ms, groq_server_total_ms
+                                     (Groq server-side clock — only when
+                                      LLM_PROVIDER=groq, else 0)
   - output_validation_ms, grounding_ms
-  - total_ms                                   (full pipeline wall clock)
-  - retry_rate                                 (fraction of queries that
-                                                 needed a 2nd generation attempt)
-  - refusal_rate, refusal_by_stage             (fraction refused, broken
-                                                 down by which stage refused)
+  - total_ms                         (full pipeline wall clock)
 
-Percentiles for generation/groq/validation/grounding stages are computed
-ONLY over queries that actually reached generation - queries refused at
-safety/relevance/retrieval never call Groq, and padding those with zeros
-would understate real generation latency.
+Percentiles for generation/groq/validation/grounding are computed ONLY
+over queries that reached generation — queries refused earlier would
+understate real generation latency if padded with zeros.
 
-NOTE ON COST/RATE LIMITS: this makes N real Groq API calls. Default is 50,
-not 200, to keep runtime and free-tier rate-limit risk reasonable - bump
-with --num-queries once you've confirmed your tier can handle it. Use
---sleep-s to add a delay between calls if you hit 429s.
+NOTE ON COST/RATE LIMITS: this makes N real LLM API calls. Default is 50
+to stay within free-tier rate limits. Use --sleep-s to pace calls if
+you hit 429s.
 
 Usage:
-    python -m evaluation.e2e_latency_eval --strategy fixed_token --num-queries 50
+    python -m evaluation.latency_eval --strategy fixed_token --num-queries 50
+    python -m evaluation.latency_eval --strategy fixed_token --num-queries 50 --sleep-s 0.5
 """
 
 import argparse
@@ -81,7 +65,7 @@ def percentile(values: list[float], p: int) -> float:
 
 
 def sum_attempt_keys(latency_ms: dict, prefix: str) -> float:
-    """Sums every key like '{prefix}_attempt1', '{prefix}_attempt2', ... .
+    """Sums every key like '{prefix}_attempt1', '{prefix}_attempt2', ...
     Represents total wall-clock/server cost actually paid across retries,
     not just the first attempt."""
     return sum(v for k, v in latency_ms.items() if k.startswith(prefix + "_attempt"))
@@ -99,7 +83,7 @@ def main():
 
     chunks_path = args.chunks_dir / f"{args.strategy}.jsonl"
 
-    print(f"Building orchestrator for strategy '{args.strategy}' (loads embed model, guardrails, retriever, Groq client once)...")
+    print(f"Building orchestrator for strategy '{args.strategy}' (loads embed model, guardrails, retriever, LLM client once)...")
     pipeline = RAGOrchestrator(
         strategy=args.strategy,
         faiss_dir=args.faiss_dir,
@@ -169,8 +153,10 @@ def main():
             time.sleep(args.sleep_s)
 
     n_ok = len(queries) - error_count
+
+    # ── Detailed per-stage table ─────────────────────────────────────────────
     print("\n" + "=" * 78)
-    print(f"END-TO-END PIPELINE LATENCY - strategy='{args.strategy}', N={n_ok} queries ({error_count} errored)")
+    print(f"END-TO-END PIPELINE LATENCY — strategy='{args.strategy}', N={n_ok} queries ({error_count} errored)")
     print("=" * 78)
     print(f"{'Stage':<32}{'P50 (ms)':<12}{'P70 (ms)':<12}{'P100 (ms)':<12}{'n':<6}")
     print("-" * 74)
@@ -186,14 +172,17 @@ def main():
     labels_gen = {
         "retrieval_ms": "Retrieval (hybrid, no rerank)",
         "generation_ms": "Generation (wall clock, all attempts)",
-        "groq_queue_ms": "  Groq: queue time",
-        "groq_completion_ms": "  Groq: completion time",
-        "groq_server_total_ms": "  Groq: server total",
+        "groq_queue_ms": "  LLM: queue time (Groq only)",
+        "groq_completion_ms": "  LLM: completion time (Groq only)",
+        "groq_server_total_ms": "  LLM: server total (Groq only)",
         "output_validation_ms": "Output validation",
-        "grounding_ms": "Grounding check",
+        "grounding_ms": "Grounding check (multi-signal)",
     }
     for key, label in labels_gen.items():
         vals = gen_only[key]
+        # Skip Groq-specific rows when all values are 0 (non-Groq provider)
+        if all(v == 0.0 for v in vals) and "groq" in key:
+            continue
         print(f"{label:<32}{percentile(vals,50):<12.2f}{percentile(vals,70):<12.2f}{percentile(vals,100):<12.2f}{len(vals):<6}")
 
     print("-" * 74)
@@ -209,13 +198,49 @@ def main():
         for stage, count in sorted(refusal_counts.items(), key=lambda kv: -kv[1]):
             print(f"  {stage}: {count}")
     if error_count:
-        print(f"[WARNING] {error_count} queries raised exceptions (network/API issues) - excluded from stage stats.")
+        print(f"[WARNING] {error_count} queries raised exceptions (network/API issues) — excluded from stage stats.")
 
-    print("\n[READ THIS] Pipeline stages (safety+relevance+retrieval+validation+grounding)")
-    print("are your own engineering and are fully in your control. Groq queue/completion")
-    print("time is external - queue_ms in particular reflects your Groq tier's request")
-    print("priority, not your code. See README latency section for the full breakdown")
-    print("and why the original <200ms target assumed a model Groq has since deprecated.")
+    # ── SUBMISSION SUMMARY: P50 / P70 / P100 ────────────────────────────────
+    total_vals  = always_present["total_ms"]
+    ret_vals    = gen_only["retrieval_ms"]
+    gen_vals    = gen_only["generation_ms"]
+    safety_vals = always_present["safety_ms"]
+    rel_vals    = always_present["relevance_ms"]
+    ground_vals = gen_only["grounding_ms"]
+
+    print("\n" + "=" * 78)
+    print("SUBMISSION LATENCY SUMMARY (P50 / P70 / P100)")
+    print("=" * 78)
+    print(f"  Full pipeline  (total_ms)  :  "
+          f"P50={percentile(total_vals,50):.1f}ms  "
+          f"P70={percentile(total_vals,70):.1f}ms  "
+          f"P100={percentile(total_vals,100):.1f}ms  (n={len(total_vals)})")
+    print(f"  Retrieval      (hybrid)    :  "
+          f"P50={percentile(ret_vals,50):.1f}ms  "
+          f"P70={percentile(ret_vals,70):.1f}ms  "
+          f"P100={percentile(ret_vals,100):.1f}ms  (n={len(ret_vals)})")
+    print(f"  Generation     (wall clock):  "
+          f"P50={percentile(gen_vals,50):.1f}ms  "
+          f"P70={percentile(gen_vals,70):.1f}ms  "
+          f"P100={percentile(gen_vals,100):.1f}ms  (n={len(gen_vals)})")
+    print(f"  Safety check               :  "
+          f"P50={percentile(safety_vals,50):.2f}ms  "
+          f"P70={percentile(safety_vals,70):.2f}ms  "
+          f"P100={percentile(safety_vals,100):.2f}ms  (n={len(safety_vals)})")
+    print(f"  Relevance check            :  "
+          f"P50={percentile(rel_vals,50):.2f}ms  "
+          f"P70={percentile(rel_vals,70):.2f}ms  "
+          f"P100={percentile(rel_vals,100):.2f}ms  (n={len(rel_vals)})")
+    print(f"  Grounding check            :  "
+          f"P50={percentile(ground_vals,50):.2f}ms  "
+          f"P70={percentile(ground_vals,70):.2f}ms  "
+          f"P100={percentile(ground_vals,100):.2f}ms  (n={len(ground_vals)})")
+    print("=" * 78)
+    print()
+    print("[NOTE] Pipeline stages (safety+relevance+retrieval+grounding) are fully")
+    print("in your control. LLM generation latency includes external API round-trip")
+    print("time (Groq/Gemini queue + compute) and will dominate the total_ms figure.")
+    print("See README latency section for the full breakdown.")
 
 
 if __name__ == "__main__":

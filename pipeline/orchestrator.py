@@ -10,6 +10,18 @@ callable entry point:
 
 Every stage timed; each call gets a request_id (per plan spec).
 
+LLM PROVIDER SELECTION:
+  Set LLM_PROVIDER env var to choose the generation backend:
+    LLM_PROVIDER=gemini   (default) — Gemini via google-genai
+    LLM_PROVIDER=groq     — Groq cloud API (requires GROQ_API_KEY)
+    LLM_PROVIDER=openai   — OpenAI API (requires OPENAI_API_KEY)
+    LLM_PROVIDER=ollama   — local Ollama (requires ollama serve + model pulled)
+
+  Groq server-side timing fields (groq_queue_ms / groq_prompt_ms /
+  groq_completion_ms / groq_server_total_ms) are only populated when the
+  provider is "groq"; for other providers they remain 0.0 in the latency
+  dict and are omitted from the printed breakdown.
+
 SCOPE NOTE: pipeline/router.py and pipeline/retry.py are NOT separate
 files here - routing is effectively done by the guardrail chain itself
 (safety -> "unsafe", relevance -> "out_of_domain", grounding -> low
@@ -20,32 +32,21 @@ KNOWN GUARDRAIL LIMITATIONS (documented earlier in the project, carried
 into this pipeline as-is):
   - relevance.py has weak discrimination on this broad, multi-domain
     corpus (see guardrails/relevance.py --calibrate findings).
-  - grounding.py is lexical overlap, not real NLI.
+  - grounding.py uses lexical + entity + sentence-level overlap, not real NLI.
 Both are real but imperfect signals, not guarantees.
-
-LATENCY NOTE (added during optimization pass): LLM generation latency
-is split into "our pipeline" time (generation_ms_attemptN, wall clock
-around the API call) and Groq's own server-side breakdown
-(groq_queue_ms / groq_prompt_ms / groq_completion_ms / groq_server_total_ms,
-pulled from response.usage). This split exists because Groq deprecated
-the fast non-reasoning model (llama-3.1-8b-instant) this project's
-original <200ms target was designed around; the replacement
-(openai/gpt-oss-20b) is a reasoning model with real per-request queue
-time on top of compute. Reporting both numbers is more honest than
-collapsing them into one figure - see README for the full breakdown.
 
 Usage (CLI smoke test):
     python -m pipeline.orchestrator --query "what is a corporation?" --strategy fixed_token
+    python -m pipeline.orchestrator --query "what is a corporation?" --strategy fixed_token --llm-provider ollama
 """
 
 import argparse
-import threading
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from guardrails.safety import SafetyGuardrail
@@ -72,6 +73,31 @@ class RAGResponse:
     latency_ms: dict = field(default_factory=dict)
 
 
+def _build_llm(provider: str | None, model: str | None):
+    """
+    Factory: returns the appropriate LLM client for the requested provider.
+
+    Provider resolution order:
+      1. explicit `provider` argument
+      2. LLM_PROVIDER environment variable
+      3. default: "gemini"
+
+    Supported providers: gemini, groq, openai, ollama
+    """
+    resolved_provider = (
+        provider
+        or os.environ.get("LLM_PROVIDER")
+        or "gemini"
+    ).lower()
+
+    if resolved_provider == "ollama":
+        from generation.ollama_llm import OllamaLLMClient
+        return OllamaLLMClient(model=model or "llama3.2:1b")
+    else:
+        # GroqLLMClient handles gemini / groq / openai — see generation/llm.py
+        return GroqLLMClient(provider=resolved_provider, model=model)
+
+
 class RAGOrchestrator:
     def __init__(
         self,
@@ -83,7 +109,8 @@ class RAGOrchestrator:
         top_k: int = 3,
         relevance_threshold: float = DEFAULT_RELEVANCE_THRESHOLD,
         grounding_threshold: float = DEFAULT_GROUNDING_THRESHOLD,
-        groq_model: str | None = None,
+        llm_provider: str | None = None,
+        llm_model: str | None = None,
     ):
         self.strategy = strategy
         self.top_k = top_k
@@ -95,13 +122,19 @@ class RAGOrchestrator:
             strategy=strategy, embeddings_dir=embeddings_dir, threshold=relevance_threshold, model=self.embed_model
         )
         self.retriever = HybridRetriever(
-            strategy=strategy,faiss_dir=faiss_dir, chunks_dir=chunks_dir,
-            dense_weight=0.9,bm25_weight=0.1,model=self.embed_model,
+            strategy=strategy, faiss_dir=faiss_dir, chunks_dir=chunks_dir,
+            dense_weight=0.9, bm25_weight=0.1, model=self.embed_model,
         )
-        self.llm = GroqLLMClient(model=groq_model) if groq_model else GroqLLMClient()
+        self.llm = _build_llm(llm_provider, llm_model)
         self.grounding_threshold = grounding_threshold
-        self._cache = {}
-        self._cache_lock = threading.Lock()
+
+        # Track whether we're on a provider that exposes Groq-style server timing
+        resolved_provider = (
+            llm_provider
+            or os.environ.get("LLM_PROVIDER")
+            or "gemini"
+        ).lower()
+        self._report_groq_timing = (resolved_provider == "groq")
 
     def _refuse(self, request_id: str, query: str, reason: str, stage: str, latency_ms: dict) -> RAGResponse:
         return RAGResponse(
@@ -114,22 +147,6 @@ class RAGOrchestrator:
         latency_ms: dict[str, float] = {}
         t_start = time.perf_counter()
 
-        # Check Cache
-        normalized_query = query.strip().lower()
-        with self._cache_lock:
-            if normalized_query in self._cache:
-                cached = self._cache[normalized_query]
-                return RAGResponse(
-                    request_id=request_id,
-                    query=query,
-                    answer=cached.answer,
-                    grounded=cached.grounded,
-                    sources=cached.sources,
-                    refusal_reason=cached.refusal_reason,
-                    stage_reached="cached_response",
-                    latency_ms={"total_ms": (time.perf_counter() - t_start) * 1000},
-                )
-
         def mark(stage: str, t0: float):
             latency_ms[stage] = (time.perf_counter() - t0) * 1000
 
@@ -141,26 +158,17 @@ class RAGOrchestrator:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
             return self._refuse(request_id, query, safety_result.reason, "safety_check", latency_ms)
 
-        # Pre-compute query embedding exactly once to reuse for both relevance check and dense retrieval
-        t_embed = time.perf_counter()
-        query_vec = self.embed_model.encode(
-            [query], convert_to_numpy=True, normalize_embeddings=True
-        )[0]
-        embed_ms = (time.perf_counter() - t_embed) * 1000
-
         # 2. Relevance (known weak discrimination on this corpus - see grounding module docstring)
         t0 = time.perf_counter()
-        relevance_result = self.relevance.check(query, query_vec=query_vec)
+        relevance_result = self.relevance.check(query)
         mark("relevance_ms", t0)
-        # Attribute query embedding encoding time to relevance_ms for latency tracking
-        latency_ms["relevance_ms"] += embed_ms
         if not relevance_result.passed:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
             return self._refuse(request_id, query, relevance_result.reason, "relevance_check", latency_ms)
 
         # 3. Retrieval (hybrid + rerank)
         t0 = time.perf_counter()
-        chunks = self.retriever.search(query, top_k=self.top_k, query_vec=query_vec)
+        chunks = self.retriever.search(query, top_k=self.top_k)
         mark("retrieval_ms", t0)
         if not chunks:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
@@ -173,14 +181,31 @@ class RAGOrchestrator:
             result = self.llm.generate(query, chunks)
             mark(f"generation_ms_attempt{attempt+1}", t0)
 
-            # Pull Groq's own server-side timing breakdown into the same
-            # latency dict, namespaced per attempt, so eval scripts can
-            # separate "our wall-clock around the call" from "Groq queue +
-            # compute" instead of only ever seeing one blended number.
-            latency_ms[f"groq_queue_ms_attempt{attempt+1}"] = result.groq_queue_ms
-            latency_ms[f"groq_prompt_ms_attempt{attempt+1}"] = result.groq_prompt_ms
-            latency_ms[f"groq_completion_ms_attempt{attempt+1}"] = result.groq_completion_ms
-            latency_ms[f"groq_server_total_ms_attempt{attempt+1}"] = result.groq_server_total_ms
+            # Pull Groq's own server-side timing breakdown when using Groq.
+            # Other providers (Gemini, Ollama, OpenAI) don't expose this;
+            # their fields stay at 0.0 and are omitted from the latency report.
+            if self._report_groq_timing:
+                latency_ms[f"groq_queue_ms_attempt{attempt+1}"] = result.groq_queue_ms
+                latency_ms[f"groq_prompt_ms_attempt{attempt+1}"] = result.groq_prompt_ms
+                latency_ms[f"groq_completion_ms_attempt{attempt+1}"] = result.groq_completion_ms
+                latency_ms[f"groq_server_total_ms_attempt{attempt+1}"] = result.groq_server_total_ms
+
+            # ── Output validation ──────────────────────────────────────────
+            # The output validator checks structural consistency of the LLMResult:
+            # sources_used tags resolve to real chunks, grounded/refusal fields
+            # are internally consistent, no parse errors.
+            # Special case: OllamaLLMClient sets refusal_reason="pending_grounding_check"
+            # as a sentinel when it has an answer but grounding hasn't run yet.
+            # We temporarily clear it so the validator sees a clean answer+sources
+            # pair rather than an apparent refusal without a legitimate reason.
+            pending_grounding = (
+                result.refusal_reason == "pending_grounding_check"
+                and bool(result.answer)
+                and bool(result.sources_used)
+            )
+            if pending_grounding:
+                result.refusal_reason = None
+                result.grounded = True  # tentatively — overwritten by grounding check below
 
             t0 = time.perf_counter()
             validation = validate_output(result, chunks)
@@ -195,13 +220,26 @@ class RAGOrchestrator:
                     "output_validation", latency_ms,
                 )
 
-            cited_chunks = chunks if result.grounded else []
+            # ── Grounding check ────────────────────────────────────────────
+            # Resolve the source tags cited by the model to their actual chunk
+            # dicts, then verify the answer is supported by those specific chunks.
+            # This is done against cited_chunks (what the model cited), NOT all
+            # retrieved candidates — grounding is checked against what was cited.
+            cited_chunks = [
+                c for c in chunks
+                if c["chunk_id"] in {
+                    tag_to_chunk_id(chunks, tag)
+                    for tag in (result.sources_used or [])
+                }
+            ]
 
             t0 = time.perf_counter()
             ground_result = grounding.check(result.answer, cited_chunks, threshold=self.grounding_threshold)
             mark(f"grounding_ms_attempt{attempt+1}", t0)
 
             if ground_result.passed:
+                result.grounded = True
+                result.refusal_reason = None
                 break
             if attempt == 0:
                 continue  # retry once
@@ -210,7 +248,7 @@ class RAGOrchestrator:
 
         latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
 
-        response = RAGResponse(
+        return RAGResponse(
             request_id=request_id,
             query=query,
             answer=result.answer,
@@ -227,9 +265,6 @@ class RAGOrchestrator:
             stage_reached="structured_response",
             latency_ms=latency_ms,
         )
-        with self._cache_lock:
-            self._cache[normalized_query] = response
-        return response
 
 
 def _resolve(chunks: list[dict], tag: str) -> dict | None:
@@ -241,9 +276,25 @@ def main():
     parser = argparse.ArgumentParser(description="Full RAG pipeline smoke test.")
     parser.add_argument("--query", type=str, required=True)
     parser.add_argument("--strategy", type=str, default="fixed_token")
+    parser.add_argument(
+        "--llm-provider",
+        type=str,
+        default=None,
+        help="LLM provider: gemini (default), groq, openai, ollama. Overrides LLM_PROVIDER env var.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default=None,
+        help="Model name override (provider-specific). Overrides LLM_MODEL env var.",
+    )
     args = parser.parse_args()
 
-    pipeline = RAGOrchestrator(strategy=args.strategy)
+    pipeline = RAGOrchestrator(
+        strategy=args.strategy,
+        llm_provider=args.llm_provider,
+        llm_model=args.llm_model,
+    )
     response = pipeline.answer(args.query)
 
     print(f"\nRequest ID: {response.request_id}")
@@ -256,6 +307,9 @@ def main():
     print(f"Sources: {[s['chunk_id'] for s in response.sources]}")
     print(f"\nLatency breakdown (ms):")
     for stage, ms in response.latency_ms.items():
+        # Skip Groq-timing fields that are 0 (non-Groq providers)
+        if isinstance(ms, float) and ms == 0.0 and "groq_" in stage:
+            continue
         print(f"  {stage}: {ms:.2f}")
 
 

@@ -24,7 +24,8 @@ def validate(result: LLMResult, retrieved_chunks: list[dict]) -> ValidationResul
     errors = []
 
     if result.parse_error:
-        errors.append("LLM output was not valid JSON")
+        reason = result.refusal_reason or "LLM output parsing or generation failed"
+        errors.append(reason)
         return ValidationResult(valid=False, errors=errors)  # nothing else to check if parsing failed
 
     if not isinstance(result.answer, str):

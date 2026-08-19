@@ -21,9 +21,6 @@ class Settings(BaseSettings):
     # ── API Keys ──────────────────────────────────────────────────────
     sarvam_api_key: str = Field(default="", description="Sarvam STT API key")
     groq_api_key: str = Field(default="", description="Groq LLM API key")
-    openai_api_key: str = Field(default="", description="OpenAI API key")
-    gemini_api_key: str = Field(default="", description="Gemini API key")
-    llm_provider: str = Field(default="groq", description="LLM provider (groq/gemini/openai)")
 
     # ── Dataset ───────────────────────────────────────────────────────
     dataset_name: str = "ai4bharat/MSMARCO-XI"

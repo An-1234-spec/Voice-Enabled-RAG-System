@@ -58,8 +58,8 @@ def main():
 
     stt_result = stt_client.transcribe(
         str(args.audio_file),
-        mode="transcribe",
-        language_code=None,
+        mode="translate",   # Returns English text for the English-only corpus.
+        language_code=None, # Auto-detect source language.
     )
 
     stt_wall_ms = (time.perf_counter() - stt_start) * 1000
