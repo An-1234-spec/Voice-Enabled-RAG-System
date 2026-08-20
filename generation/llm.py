@@ -13,6 +13,36 @@ Provider/model are selected through:
 Example:
     $env:LLM_PROVIDER="gemini"
     $env:LLM_MODEL="gemini-2.5-flash-lite"
+
+LATENCY FIX (2026-08-21): the orchestrator calls generate(query, chunks)
+with no keyword overrides, so this method's own defaults are what every
+Groq request actually used. Two of those defaults were silently costing
+hundreds of ms on openai/gpt-oss-20b:
+
+  1. reasoning_effort defaulted to None, so the `if reasoning_effort and
+     "gpt-oss" in self.model` guard below never fired, and Groq applied
+     its OWN default for gpt-oss models — which is 'medium' (confirmed
+     via Groq's API reference: "'medium' is the default value" for
+     openai/gpt-oss-20b and openai/gpt-oss-120b). Medium-effort reasoning
+     generates hidden reasoning tokens before the visible answer, and
+     those tokens are billed against the same completion budget/wall
+     clock — for a one-sentence RAG answer this is pure overhead.
+     Fixed by defaulting reasoning_effort="low" (a valid value for this
+     model family; 'none' is NOT accepted by gpt-oss, only qwen3 accepts
+     'none'/'default' — verified against Groq's docs, not assumed).
+
+  2. max_completion_tokens defaulted to 512 — far more than a ~30-word
+     grounded answer + citation tag needs. Cut to 120 as a starting
+     point (more conservative than Ollama's 48, since gpt-oss reasoning
+     tokens may still consume some of this budget even at low effort —
+     needs experimental validation via evaluation/latency_eval.py before
+     tightening further; going straight to a very low value risks
+     reproducing the earlier "truncated answer, citation cut off"
+     failure mode already seen once in generation/ollama_llm.py).
+
+Re-run a single-query smoke test (python -m generation.llm --query ...)
+to confirm Grounded=True and a visibly lower groq_completion_ms before
+trusting a full 200-query eval on this change.
 """
 
 from __future__ import annotations
@@ -178,8 +208,8 @@ class GroqLLMClient:
         query: str,
         chunks: list[dict],
         temperature: float = 0.0,
-        max_completion_tokens: int = 512,
-        reasoning_effort: str | None = None,
+        max_completion_tokens: int = 120,  # was 512 — cut for a one-sentence RAG answer; sweep lower once reasoning_effort="low" is confirmed stable
+        reasoning_effort: str | None = "low",  # was None — gpt-oss silently defaulted to Groq's own 'medium', burning hidden reasoning tokens on every call
     ) -> LLMResult:
 
         messages = build_messages(query, chunks)
@@ -250,6 +280,11 @@ class GroqLLMClient:
 
             extra_body = {}
 
+            # NOTE: gpt-oss accepts 'low'/'medium'/'high' only — it does
+            # NOT accept 'none' (that's qwen3-only, per Groq's API docs).
+            # If you ever swap to a qwen3 model on Groq and want reasoning
+            # off entirely, 'none' is valid THERE but not here — don't
+            # copy this value across model families without checking.
             if (
                 reasoning_effort
                 and "gpt-oss" in self.model
@@ -429,6 +464,19 @@ def main():
         default=None,
     )
 
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default="low",
+        help="For gpt-oss models on Groq: low, medium, or high. Default 'low' for latency.",
+    )
+
+    parser.add_argument(
+        "--max-completion-tokens",
+        type=int,
+        default=120,
+    )
+
     args = parser.parse_args()
 
     print(
@@ -478,14 +526,19 @@ def main():
     print(
         f"\nCalling "
         f"{llm.provider.upper()} "
-        f"({llm.model})..."
+        f"({llm.model}) "
+        f"reasoning_effort={args.reasoning_effort} "
+        f"max_completion_tokens={args.max_completion_tokens}..."
     )
 
+    t0 = time.perf_counter()
     result = llm.generate(
         args.query,
         chunks,
-        max_completion_tokens=512,
+        max_completion_tokens=args.max_completion_tokens,
+        reasoning_effort=args.reasoning_effort,
     )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
 
     print(
         f"\nAnswer: {result.answer}"
@@ -531,6 +584,8 @@ def main():
             f"\n[{llm.provider} API timing] "
             f"total={result.groq_server_total_ms:.0f}ms"
         )
+
+    print(f"Wall-clock (this call): {elapsed_ms:.2f} ms")
 
 
 if __name__ == "__main__":

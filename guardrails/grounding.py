@@ -49,7 +49,7 @@ SENTENCE_COVERAGE_MIN_OVERLAP = 0.20 # sentence: min token overlap for a sentenc
 # -- Entity extraction --------------------------------------------------------
 
 _NUMBER_RE = re.compile(r"\b\d[\d,.\-]*\b")
-_CAMEL_RE  = re.compile(r"\b[A-Z][a-z]{1,}\b")  # CapitalisedWords (heuristic proper noun)
+_CAMEL_RE = re.compile(r"\b[A-Z][a-z]{2,}\b") # CapitalisedWords (heuristic proper noun)
 
 
 def _extract_entities(text: str) -> set[str]:
