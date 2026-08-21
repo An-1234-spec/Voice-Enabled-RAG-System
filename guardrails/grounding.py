@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 
 from retrieval.bm25_retriever import tokenize
 
-DEFAULT_OVERLAP_THRESHOLD = 0.30     # see THRESHOLD CHANGE note above
+DEFAULT_OVERLAP_THRESHOLD = 0.30    # see THRESHOLD CHANGE note above
 ENTITY_PRESENCE_THRESHOLD = 0.80
 SENTENCE_COVERAGE_MIN_OVERLAP = 0.20
 
