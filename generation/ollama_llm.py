@@ -54,7 +54,7 @@ DEFAULT_HOST = "http://127.0.0.1:11434"  # NOT "localhost" - avoids Windows DNS 
 # Was 180 (fix for an earlier 24-token truncation bug). Cut to 48 for a
 # latency-critical 1-sentence-answer target. VALIDATE EXPERIMENTALLY before
 # trusting this in a submission — sweep 32/48/64 against grounding pass rate.
-DEFAULT_MAX_TOKENS = 48
+DEFAULT_MAX_TOKENS = 32
 
 # Was 768 (headroom for a 180-token output). Prompt runs ~228 tok per the
 # original measurement; 384 leaves ~150 tok of headroom for a 48-tok answer.
