@@ -157,9 +157,24 @@ class RAGOrchestrator:
         grounding_threshold: float = DEFAULT_GROUNDING_THRESHOLD,
         llm_provider: str | None = None,
         llm_model: str | None = None,
+        max_generation_attempts: int | None = None,
     ):
         self.strategy = strategy
         self.top_k = top_k
+
+        # P100 EXPERIMENT (2026-08-21): retries are the dominant P100 driver
+        # — any retried query pays for two full generation calls, so P100
+        # (worst of N) is almost always a retried query. Setting this to 1
+        # removes retries entirely: every query becomes exactly one
+        # generation call, so P100 collapses toward P50 by construction.
+        # Trade-off is real, not free — grounding failures that a retry
+        # might have recovered from now refuse outright instead. Default
+        # of 2 preserves existing behavior; override via constructor arg
+        # or MAX_GENERATION_ATTEMPTS env var to A/B test the trade-off.
+        self.max_generation_attempts = (
+            max_generation_attempts
+            or int(os.environ.get("MAX_GENERATION_ATTEMPTS", "2"))
+        )
 
         # Loaded ONCE per orchestrator instance. Caller (app/api.py) MUST
         # construct exactly one RAGOrchestrator per server process and
@@ -213,8 +228,24 @@ class RAGOrchestrator:
             return self._refuse(request_id, query, safety_result.reason, "safety_check", latency_ms)
 
         # 2. Relevance (known weak discrimination on this corpus - see grounding module docstring)
+        #
+        # FIX (2026-08-21): both RelevanceGuardrail.check() and
+        # HybridRetriever.search() accept an optional precomputed
+        # query_vec and skip their own internal SentenceTransformer.encode()
+        # call when given one (see hybrid.py: dense_results =
+        # self.dense.search(query, top_k=top_n_raw, query_vec=query_vec)).
+        # This orchestrator was calling both with no query_vec, so the
+        # SAME query string was being embedded twice, on every single
+        # request, for no reason — real wasted compute on every query, not
+        # just a tail-latency issue. Embed once here, share it.
         t0 = time.perf_counter()
-        relevance_result = self.relevance.check(query)
+        query_vec = self.embed_model.encode(
+            [query], convert_to_numpy=True, normalize_embeddings=True
+        )[0]
+        mark("query_embed_ms", t0)
+
+        t0 = time.perf_counter()
+        relevance_result = self.relevance.check(query, query_vec=query_vec)
         mark("relevance_ms", t0)
         if not relevance_result.passed:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
@@ -222,7 +253,7 @@ class RAGOrchestrator:
 
         # 3. Retrieval (hybrid + rerank)
         t0 = time.perf_counter()
-        chunks = self.retriever.search(query, top_k=self.top_k)
+        chunks = self.retriever.search(query, top_k=self.top_k, query_vec=query_vec)
         mark("retrieval_ms", t0)
         if not chunks:
             latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
@@ -238,7 +269,7 @@ class RAGOrchestrator:
         used_citation_fallback = False
         attempts_made = 0
 
-        for attempt in range(2):
+        for attempt in range(self.max_generation_attempts):
             attempts_made = attempt + 1
             print(f"GENERATION ATTEMPT {attempts_made}\n  reason: {retry_reason}")
 
@@ -275,7 +306,7 @@ class RAGOrchestrator:
                 result.refusal_reason = None
 
             if not result.answer:
-                if attempt == 0:
+                if attempt < self.max_generation_attempts - 1:
                     retry_reason = "empty_response"
                     continue
                 latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
@@ -344,7 +375,7 @@ class RAGOrchestrator:
             mark(f"output_validation_ms_attempt{attempts_made}", t0)
 
             if not validation.valid:
-                if attempt == 0:
+                if attempt < self.max_generation_attempts - 1:
                     retry_reason = f"malformed_output: {'; '.join(validation.errors)}"
                     continue
                 latency_ms["total_ms"] = (time.perf_counter() - t_start) * 1000
@@ -356,7 +387,7 @@ class RAGOrchestrator:
             if ground_result.passed:
                 break
 
-            if attempt == 0:
+            if attempt < self.max_generation_attempts - 1:
                 retry_reason = f"ungrounded: {ground_result.reason}"
                 continue
 
