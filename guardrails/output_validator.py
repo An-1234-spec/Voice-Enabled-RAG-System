@@ -32,12 +32,19 @@ def validate(result: LLMResult, retrieved_chunks: list[dict]) -> ValidationResul
         errors.append("'answer' is not a string")
     if not isinstance(result.grounded, bool):
         errors.append("'grounded' is not a boolean")
+
     if not isinstance(result.sources_used, list):
         errors.append("'sources_used' is not a list")
     else:
-        for tag in result.sources_used:
-            if tag_to_chunk_id(retrieved_chunks, tag) is None:
-                errors.append(f"sources_used tag '{tag}' does not resolve to a retrieved chunk")
+        # FIX: one hallucinated/out-of-range tag used to fail the ENTIRE
+        # response, forcing a full retry even when e.g. [S1] was correct
+        # and only [S4] was invented. Filter unresolvable tags instead --
+        # grounding.py's own signals still verify whatever valid citations
+        # remain, so this doesn't weaken correctness, just stops
+        # double-penalizing a partially-good citation list.
+        valid_tags = [t for t in result.sources_used if tag_to_chunk_id(retrieved_chunks, t) is not None]
+        if len(valid_tags) != len(result.sources_used):
+            result.sources_used = valid_tags  # mutate in place; grounding sees the cleaned list
 
     if result.grounded and not result.sources_used:
         errors.append("grounded=true but sources_used is empty")

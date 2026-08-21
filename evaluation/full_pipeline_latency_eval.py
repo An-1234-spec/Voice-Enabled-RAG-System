@@ -1,39 +1,28 @@
 """
 evaluation/full_pipeline_latency_eval.py
 
-Full end-to-end pipeline latency benchmark: safety -> relevance ->
-retrieval (hybrid+rerank) -> generation (Ollama) -> output validation ->
-grounding, timed as one real user-facing request. One retry max, only on
-genuine output-validation or grounding failure (per spec: no unnecessary
-retries). Warmup call excluded from stats.
+Full end-to-end pipeline latency benchmark, wrapping the real
+pipeline.orchestrator.RAGOrchestrator directly (no reimplemented guardrail
+logic - see prior version's postmortem for why that matters).
 
-ASSUMPTION: uses guardrails.safety/relevance/output_validator/grounding
-as originally built. If your project's versions of these have diverged,
-timings for those stages may not reflect your actual current code -
-paste them if so and this script gets adjusted to match exactly.
+Includes a grounding-failure signal breakdown: every GroundingResult
+carries a `reason` string naming exactly which signal(s) failed
+(lexical/entity/sentence/no-sources) - this script now surfaces that
+instead of only reporting the aggregate refusal count, so root-causing a
+high grounding_check refusal rate doesn't require guessing.
 
 Usage:
-    python -m evaluation.full_pipeline_latency_eval --strategy fixed_token \
-        --num-queries 200 --top-k 2 --max-tokens 24
+    python -m evaluation.full_pipeline_latency_eval --strategy fixed_token --num-queries 200
 """
 
 import argparse
 import itertools
 import json
-import time
 from pathlib import Path
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
-from guardrails.safety import SafetyGuardrail
-from guardrails.relevance import RelevanceGuardrail
-from guardrails.output_validator import validate as validate_output
-from guardrails import grounding
-from generation.ollama_llm import OllamaLLMClient
-from retrieval.reranker import RerankedRetriever
-
-RELEVANCE_THRESHOLD = -0.0613  # from earlier calibration
+from pipeline.orchestrator import RAGOrchestrator
 
 
 def collect_queries(chunks_path: Path) -> list[str]:
@@ -56,111 +45,85 @@ def percentile(values, p):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Full-pipeline warm latency benchmark.")
+    parser = argparse.ArgumentParser(description="Full-pipeline latency benchmark (via real orchestrator).")
     parser.add_argument("--strategy", type=str, default="fixed_token")
     parser.add_argument("--num-queries", type=int, default=200)
     parser.add_argument("--top-k", type=int, default=2)
-    parser.add_argument("--retrieve-n", type=int, default=10)
-    parser.add_argument("--max-tokens", type=int, default=24)
-    parser.add_argument("--model", type=str, default="llama3.2:1b")
-    parser.add_argument("--faiss-dir", type=Path, default=Path("data/processed/faiss"))
+    parser.add_argument("--llm-model", type=str, default="llama3.2:1b")
     parser.add_argument("--chunks-dir", type=Path, default=Path("data/processed/chunks"))
-    parser.add_argument("--embeddings-dir", type=Path, default=Path("data/processed/embeddings"))
-    parser.add_argument("--baseline-p50", type=float, default=None, help="Prior P50 in ms, for the improvement report")
     args = parser.parse_args()
 
     chunks_path = args.chunks_dir / f"{args.strategy}.jsonl"
 
-    print("Loading model + building pipeline (once, reused for all queries)...")
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-    safety = SafetyGuardrail()
-    relevance = RelevanceGuardrail(strategy=args.strategy, embeddings_dir=args.embeddings_dir, threshold=RELEVANCE_THRESHOLD, model=embed_model)
-    retriever = RerankedRetriever(strategy=args.strategy, base_mode="hybrid", faiss_dir=args.faiss_dir, chunks_dir=args.chunks_dir, retrieve_n=args.retrieve_n, model=embed_model)
-    llm = OllamaLLMClient(model=args.model)
+    print("Building RAGOrchestrator (provider=ollama, explicit)...")
+    pipeline = RAGOrchestrator(
+        strategy=args.strategy,
+        top_k=args.top_k,
+        llm_provider="ollama",
+        llm_model=args.llm_model,
+    )
 
     distinct_queries = collect_queries(chunks_path)
     queries = list(itertools.islice(itertools.cycle(distinct_queries), args.num_queries))
 
     print("Warmup call (not counted)...")
-    warmup_chunks = retriever.search(queries[0], top_k=args.top_k)
-    llm.generate(queries[0], warmup_chunks, max_tokens=args.max_tokens)
+    pipeline.answer(queries[0])
 
-    stage_times = {"safety_ms": [], "relevance_ms": [], "retrieval_ms": [], "generation_ms": [], "validation_ms": [], "total_ms": []}
+    print(f"Running {len(queries)} timed queries through the real orchestrator...")
+    all_latency: dict[str, list[float]] = {}
     success_count, refusal_count, retry_count = 0, 0, 0
+    refusal_stages: dict[str, int] = {}
+    grounding_refusal_reasons: list[str] = []
 
-    print(f"Running {len(queries)} timed queries...")
     for i, query in enumerate(queries, 1):
-        t_start = time.perf_counter()
+        response = pipeline.answer(query)
 
-        t0 = time.perf_counter()
-        safety_result = safety.check(query)
-        stage_times["safety_ms"].append((time.perf_counter() - t0) * 1000)
-        if not safety_result.passed:
-            refusal_count += 1
-            stage_times["total_ms"].append((time.perf_counter() - t_start) * 1000)
-            continue
+        for stage, ms in response.latency_ms.items():
+            all_latency.setdefault(stage, []).append(ms)
 
-        t0 = time.perf_counter()
-        relevance_result = relevance.check(query)
-        stage_times["relevance_ms"].append((time.perf_counter() - t0) * 1000)
-        if not relevance_result.passed:
-            refusal_count += 1
-            stage_times["total_ms"].append((time.perf_counter() - t_start) * 1000)
-            continue
-
-        t0 = time.perf_counter()
-        chunks = retriever.search(query, top_k=args.top_k)
-        stage_times["retrieval_ms"].append((time.perf_counter() - t0) * 1000)
-
-        result, attempt = None, 0
-        for attempt in range(2):
-            t0 = time.perf_counter()
-            result = llm.generate(query, chunks, max_tokens=args.max_tokens)
-            gen_ms = (time.perf_counter() - t0) * 1000
-
-            t0 = time.perf_counter()
-            validation = validate_output(result, chunks)
-            val_ms = (time.perf_counter() - t0) * 1000
-
-            if validation.valid and result.grounded:
-                break
-            if attempt == 0:
-                retry_count += 1
-                continue
-            break  # second attempt also failed - accept as refusal below
-
-        stage_times["generation_ms"].append(gen_ms)
-        stage_times["validation_ms"].append(val_ms)
-
-        if result and result.grounded and validation.valid:
+        if response.grounded and response.answer:
             success_count += 1
         else:
             refusal_count += 1
+            refusal_stages[response.stage_reached] = refusal_stages.get(response.stage_reached, 0) + 1
+            if response.stage_reached == "grounding_check":
+                grounding_refusal_reasons.append(response.refusal_reason or "<no reason recorded>")
 
-        stage_times["total_ms"].append((time.perf_counter() - t_start) * 1000)
+        if response.generation_attempts > 1:
+            retry_count += 1
 
         if i % 25 == 0:
             print(f"  ...{i}/{len(queries)}")
 
     print("\n" + "=" * 70)
-    print(f"FULL PIPELINE LATENCY - N={len(queries)}, model={args.model}, top_k={args.top_k}, max_tokens={args.max_tokens}")
+    print(f"FULL PIPELINE LATENCY (via real orchestrator) - N={len(queries)}, model={args.llm_model}, top_k={args.top_k}")
     print("=" * 70)
-    print(f"{'Stage':<20}{'P50':<10}{'P70':<10}{'P100':<10}{'Mean':<10}")
-    for stage, vals in stage_times.items():
+    for stage in sorted(all_latency.keys()):
+        vals = all_latency[stage]
         if vals:
-            print(f"{stage:<20}{percentile(vals,50):<10.2f}{percentile(vals,70):<10.2f}{percentile(vals,100):<10.2f}{np.mean(vals):<10.2f}")
+            print(f"{stage:<35}P50={percentile(vals,50):<9.2f}P70={percentile(vals,70):<9.2f}P100={percentile(vals,100):<9.2f}n={len(vals)}")
 
-    print(f"\nSuccess: {success_count}  Refusals: {refusal_count}  Retries: {retry_count}")
+    print(f"\nSuccess: {success_count}  Refusals: {refusal_count}  Retries (2nd attempt needed): {retry_count}")
+    print(f"Refusals by stage: {refusal_stages}")
 
-    total = stage_times["total_ms"]
+    if grounding_refusal_reasons:
+        lexical_fails = sum("lexical" in r for r in grounding_refusal_reasons)
+        entity_fails = sum("entity" in r for r in grounding_refusal_reasons)
+        sentence_fails = sum("sentence" in r for r in grounding_refusal_reasons)
+        no_sources = sum("no sources cited" in r for r in grounding_refusal_reasons)
+        print(f"\nGrounding failure signal breakdown (n={len(grounding_refusal_reasons)}, signals can overlap):")
+        print(f"  lexical:  {lexical_fails}")
+        print(f"  entity:   {entity_fails}")
+        print(f"  sentence: {sentence_fails}")
+        print(f"  no cited sources: {no_sources}")
+        print(f"\nFirst 8 example reasons:")
+        for r in grounding_refusal_reasons[:8]:
+            print(f"  - {r}")
+
+    total = all_latency.get("total_ms", [])
     p50, p70, p100 = percentile(total, 50), percentile(total, 70), percentile(total, 100)
     print(f"\nP50={p50:.2f}ms  P70={p70:.2f}ms  P100={p100:.2f}ms")
-    print(f"Target: P50<=150ms P70<=175ms P100<200ms -> "
-          f"{'MET' if p50<=150 and p70<=175 and p100<200 else 'NOT MET'}")
-
-    if args.baseline_p50:
-        print(f"\nBASELINE P50: {args.baseline_p50:.2f}ms  ->  AFTER: {p50:.2f}ms  "
-              f"(reduction: {args.baseline_p50 - p50:.2f}ms, {100*(1-p50/args.baseline_p50):.1f}%)")
+    print(f"Target: P50<=150ms P70<=175ms P100<200ms -> {'MET' if p50<=150 and p70<=175 and p100<200 else 'NOT MET'}")
 
 
 if __name__ == "__main__":

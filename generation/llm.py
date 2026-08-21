@@ -173,7 +173,16 @@ class GroqLLMClient:
                     "GROQ_API_KEY not set."
                 )
 
-            self.groq_client = Groq(api_key=key)
+            # max_retries=0: the SDK's default retry behavior sleeps and
+            # retries on 429 (rate limit) before returning, which silently
+            # inflates measured wall-clock latency by seconds per throttled
+            # call — this showed up directly in a 200-query eval run as
+            # P100=48,394ms even though the underlying Groq server_total
+            # for successful calls stayed under 150ms. Fail fast instead:
+            # a throttled request should surface immediately as an error
+            # the orchestrator can log/refuse on, not a multi-second sleep
+            # baked into the latency number.
+            self.groq_client = Groq(api_key=key, max_retries=0, timeout=10.0)
 
         # ---------------------------------------------------------
         # OPENAI

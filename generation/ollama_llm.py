@@ -48,7 +48,7 @@ from generation.llm import LLMResult
 from generation.prompts import build_messages, parse_cited_answer
 from retrieval.reranker import RerankedRetriever
 
-DEFAULT_MODEL = "llama3.2:1b"
+DEFAULT_MODEL = "qwen2.5:1.5b"
 DEFAULT_HOST = "http://127.0.0.1:11434"  # NOT "localhost" - avoids Windows DNS delay
 
 # Was 180 (fix for an earlier 24-token truncation bug). Cut to 48 for a
